@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -62,6 +63,41 @@ int object_exists(const ObjectID *id) {
 
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
+static const char *object_type_name(ObjectType type) {
+    switch (type) {
+        case OBJ_BLOB:   return "blob";
+        case OBJ_TREE:   return "tree";
+        case OBJ_COMMIT: return "commit";
+        default:         return NULL;
+    }
+}
+
+static int parse_object_type(const char *type_str, ObjectType *type_out) {
+    if (strcmp(type_str, "blob") == 0) {
+        *type_out = OBJ_BLOB;
+        return 0;
+    }
+    if (strcmp(type_str, "tree") == 0) {
+        *type_out = OBJ_TREE;
+        return 0;
+    }
+    if (strcmp(type_str, "commit") == 0) {
+        *type_out = OBJ_COMMIT;
+        return 0;
+    }
+    return -1;
+}
+
+static int write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 // Write an object to the store.
 //
 // Object format on disk:
@@ -94,9 +130,86 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    if (!id_out || (!data && len > 0)) return -1;
+
+    const char *type_name = object_type_name(type);
+    if (!type_name) return -1;
+
+    char header[64];
+    int header_chars = snprintf(header, sizeof(header), "%s %zu", type_name, len);
+    if (header_chars < 0 || (size_t)header_chars + 1 >= sizeof(header)) return -1;
+    size_t header_len = (size_t)header_chars + 1;  // include '\0'
+
+    if (len > SIZE_MAX - header_len) return -1;
+    size_t object_len = header_len + len;
+
+    uint8_t *object_buf = malloc(object_len);
+    if (!object_buf) return -1;
+    memcpy(object_buf, header, header_len);
+    if (len > 0) memcpy(object_buf + header_len, data, len);
+
+    compute_hash(object_buf, object_len, id_out);
+
+    if (object_exists(id_out)) {
+        free(object_buf);
+        return 0;
+    }
+
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+
+    char shard_dir[512];
+    if (snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex) >= (int)sizeof(shard_dir)) {
+        free(object_buf);
+        return -1;
+    }
+
+    if (mkdir(shard_dir, 0755) != 0 && errno != EEXIST) {
+        free(object_buf);
+        return -1;
+    }
+
+    char final_path[512];
+    object_path(id_out, final_path, sizeof(final_path));
+
+    char tmp_path[640];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s/.tmp-XXXXXX", shard_dir) >= (int)sizeof(tmp_path)) {
+        free(object_buf);
+        return -1;
+    }
+
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        free(object_buf);
+        return -1;
+    }
+
+    int rc = 0;
+    if (write_all(fd, object_buf, object_len) != 0) rc = -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0 && rc == 0) rc = -1;
+    if (rc == 0 && rename(tmp_path, final_path) != 0) rc = -1;
+
+    if (rc != 0) {
+        unlink(tmp_path);
+        free(object_buf);
+        return -1;
+    }
+
+    int dfd = open(shard_dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        free(object_buf);
+        return -1;
+    }
+    if (fsync(dfd) != 0) {
+        close(dfd);
+        free(object_buf);
+        return -1;
+    }
+    close(dfd);
+
+    free(object_buf);
+    return 0;
 }
 
 // Read an object from the store.
@@ -122,7 +235,100 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    if (!id || !type_out || !data_out || !len_out) return -1;
+
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long fsize = ftell(f);
+    if (fsize < 0) {
+        fclose(f);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    size_t raw_len = (size_t)fsize;
+    uint8_t *raw = malloc(raw_len > 0 ? raw_len : 1);
+    if (!raw) {
+        fclose(f);
+        return -1;
+    }
+
+    if (raw_len > 0 && fread(raw, 1, raw_len, f) != raw_len) {
+        free(raw);
+        fclose(f);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    ObjectID computed;
+    compute_hash(raw, raw_len, &computed);
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    uint8_t *nul = memchr(raw, '\0', raw_len);
+    if (!nul) {
+        free(raw);
+        return -1;
+    }
+
+    size_t header_len = (size_t)(nul - raw);
+    if (header_len >= 64) {
+        free(raw);
+        return -1;
+    }
+
+    char header[64];
+    memcpy(header, raw, header_len);
+    header[header_len] = '\0';
+
+    char type_name[16];
+    size_t declared_size = 0;
+    if (sscanf(header, "%15s %zu", type_name, &declared_size) != 2) {
+        free(raw);
+        return -1;
+    }
+    if (parse_object_type(type_name, type_out) != 0) {
+        free(raw);
+        return -1;
+    }
+
+    size_t payload_off = header_len + 1;
+    if (payload_off > raw_len) {
+        free(raw);
+        return -1;
+    }
+    size_t payload_len = raw_len - payload_off;
+    if (declared_size != payload_len) {
+        free(raw);
+        return -1;
+    }
+
+    void *payload = malloc(payload_len > 0 ? payload_len : 1);
+    if (!payload) {
+        free(raw);
+        return -1;
+    }
+    if (payload_len > 0) memcpy(payload, raw + payload_off, payload_len);
+
+    *data_out = payload;
+    *len_out = payload_len;
+
+    free(raw);
+    return 0;
 }
