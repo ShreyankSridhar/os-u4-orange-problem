@@ -6,6 +6,80 @@
 
 ---
 
+## Submission Report (All Phases Complete)
+
+**Status:** Complete  
+**Repository:** `ShreyankSridhar/os-u4-orange-problem`  
+**Validation Date:** April 17, 2026
+
+### Completion Summary
+
+| Phase | Status | Evidence |
+| ----- | ------ | -------- |
+| 1: Object Storage Foundation | Completed | [1A test output](screenshots/1A_test_objects.png), [1B object sharding](screenshots/1B_objects_sharded.png) |
+| 2: Tree Objects | Completed | [2A test output](screenshots/2A_test_tree.png), [2B raw tree binary](screenshots/2B_tree_xxd.png) |
+| 3: Index (Staging Area) | Completed | [3A init/add/status](screenshots/3A_init_add_status.png), [3B index file format](screenshots/3B_index_file.png) |
+| 4: Commits and History | Completed | [4A log output](screenshots/4A_log_three_commits.png), [4B object growth](screenshots/4B_pes_files_growth.png), [4C refs and HEAD](screenshots/4C_refs_and_head.png) |
+| Final Integration | Completed | [Integration run](screenshots/Final_integration_test.png) |
+
+### Validation Commands
+
+```bash
+make clean
+make all
+./test_objects
+./test_tree
+make test-integration
+```
+
+### Analysis Answers (Phase 5 and 6)
+
+#### Q5.1: How to implement `pes checkout <branch>`
+
+1. Resolve `.pes/refs/heads/<branch>` to get target commit hash.
+2. Update `.pes/HEAD` to `ref: refs/heads/<branch>`.
+3. Read target commit, then its tree, and materialize files/directories in the working directory.
+4. Remove tracked files that exist in current branch tree but not in target branch tree.
+5. Rebuild `.pes/index` from target tree contents so staged metadata matches checkout state.
+
+Complexity comes from safely transforming the working directory while preserving untracked files and refusing destructive overwrites when tracked files have local modifications.
+
+#### Q5.2: Detect dirty working directory conflicts
+
+1. Walk tracked paths from current index.
+2. For each tracked file, compare current filesystem metadata/content against index entry (mtime/size fast path, optional hash confirm).
+3. Resolve the same path in target branch tree.
+4. If file is dirty locally and target version differs from current committed/indexed version, declare conflict and abort checkout.
+
+This prevents clobbering user changes that are not committed.
+
+#### Q5.3: Detached HEAD behavior and recovery
+
+In detached HEAD, new commits advance only the direct commit pointer in `HEAD`, not a branch ref, so commits can become unreachable after switching away. Recovery is done by creating a branch pointing to that commit (`git branch <name> <hash>` equivalent) before GC prunes unreachable objects.
+
+#### Q6.1: Reachability-based garbage collection
+
+1. Start from all refs (`.pes/refs/heads/*` and possibly tags).
+2. DFS/BFS through commit graph via parent pointers.
+3. For each reachable commit, mark referenced tree.
+4. Recursively walk trees, marking child trees and blobs.
+5. Sweep object store and delete unmarked hashes.
+
+Use a hash set for `reachable` to get O(1) membership checks.  
+For 100,000 commits and 50 branches, visited commits are near 100,000 if branch histories overlap heavily; total visited objects are commits plus reachable trees/blobs.
+
+#### Q6.2: Why concurrent GC is dangerous
+
+Race example:
+1. Commit process writes new blob/tree/commit objects.
+2. Before ref update is atomic, GC scans refs and does not see new commit as reachable.
+3. GC deletes those just-written objects.
+4. Commit then updates branch ref to a now-missing commit/tree/blob.
+
+Real Git mitigates this with lock discipline, reflogs, grace periods, and conservative pruning policies that avoid deleting very recent/unreferenced objects immediately.
+
+---
+
 ## Getting Started
 
 ### Prerequisites
